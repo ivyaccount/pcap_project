@@ -12,7 +12,7 @@
 
 int DEBUG = 0; // set to 1 for debugging prints
 int clauseNumber, variableNumber;
-int * valuation; // global valuation array for ease of access during recursion
+int * valuation_global; // global valuation array for ease of access during recursion
 
 struct Literal {
   struct Literal * next; // points to the next literal in the clause
@@ -44,7 +44,7 @@ struct Literal * createLiteral(){
 void printValuation(){
   int i;
   for (i = 1; i < variableNumber + 1; i++) {
-    printf("%d ", valuation[i]);
+    printf("%d ", valuation_global[i]);
   }
   printf("\n");
 }
@@ -129,7 +129,7 @@ int findPureLiteral(struct Clause * root){
 // implements unit propagation algorithm
 // returns 0 if it's unable to perform the algorithm in case there are no unit literals
 // for standalone (unit) literal, set its value
-int unitPropagation(struct Clause * root){
+int unitPropagation(struct Clause * root, int * valuation){
   int unitLiteralIndex = findUnitClause(root);
   if (DEBUG) printf("unit clause found with literal: %d\n", unitLiteralIndex);
   if (unitLiteralIndex == 0) return 0;
@@ -137,6 +137,10 @@ int unitPropagation(struct Clause * root){
   // set the valuation for that literal
   if (DEBUG) printf("Setting value of literal %d as %d\n", abs(unitLiteralIndex), unitLiteralIndex > 0 ? 1 : 0);
   // set the literal to 1 if pos, else 0 (to make it always sat)
+  // #pragma omp critcal (unitPropagationValuationUpdate)
+  // {
+  //   valuation[abs(unitLiteralIndex)] = unitLiteralIndex > 0 ? 1 : 0;
+  // }
   valuation[abs(unitLiteralIndex)] = unitLiteralIndex > 0 ? 1 : 0;
 
   // iterate over the clause set to
@@ -187,13 +191,17 @@ int unitPropagation(struct Clause * root){
 
 // implements pure literal elimination algorithm
 // returns 0 if it's unable to perform the algorithm in case there are no pure literals
-int pureLiteralElimination(struct Clause * root){
+int pureLiteralElimination(struct Clause * root, int * valuation){
   int pureLiteralIndex = findPureLiteral(root);
   if (DEBUG) printf("pure literal found: %d\n", pureLiteralIndex);
   if (pureLiteralIndex == 0) return 0;
 
   // set the valuation for that literal
   if (DEBUG) printf("Setting value of literal %d as %d\n", abs(pureLiteralIndex), pureLiteralIndex > 0 ? 1 : 0);
+  // #pragma omp critical (pureLiteralEliminationValuationUpdate)
+  // {
+  //   valuation[abs(pureLiteralIndex)] = pureLiteralIndex > 0 ? 1 : 0;
+  // }
   valuation[abs(pureLiteralIndex)] = pureLiteralIndex > 0 ? 1 : 0;
 
   // iterate over the clause set to
@@ -272,12 +280,12 @@ struct Clause * readClauseSet_omp(char * filename){
         sscanf(line, "p cnf %d %d", &variableNumber, &clauseNumber);
         if (DEBUG) printf("Number of variables: %d\n", variableNumber);
         if (DEBUG) printf("Number of clauses: %d\n", clauseNumber);
-        valuation = (int*) calloc(variableNumber + 1, sizeof(int));
+        valuation_global = (int*) calloc(variableNumber + 1, sizeof(int));
 
         //initialize
         // #pragma omp parallel for
         for (int i = 0; i < variableNumber + 1; i++){
-          valuation[i] = -1;
+          valuation_global[i] = -1;
         }
       
       } else {
@@ -364,7 +372,7 @@ struct Clause * readClauseSet_omp(char * filename){
 // checks if all the remaining clauses contain non-conflicting literals
 // i.e. for each literal remaining in the clause set, either positive or
 // negative index should be present. If that's the case, satisfiability is solved.
-int areAllClausesUnit(struct Clause * root){
+int areAllClausesUnit(struct Clause * root, int * valuation){
   int * literalLookup = (int*) calloc(variableNumber + 1, sizeof(int));
 
   struct Clause* itr = root;
@@ -391,7 +399,12 @@ int areAllClausesUnit(struct Clause * root){
     struct Literal * l = itr->head;
     while (l != NULL){
       //1 means not neg, 0 means neg
+      // #pragma omp critical (decideValuation)
+      // {
+      //   valuation[abs(l->index)] = l->index > 0 ? 1 : 0;
+      // }
       valuation[abs(l->index)] = l->index > 0 ? 1 : 0;
+
       l = l->next;
     }
     itr = itr->next;
@@ -414,9 +427,9 @@ int containsEmptyClause(struct Clause * root){
 
 // checks if the current state of the clause set represents a solution
 //TODO: Understand why empty clause (with no literal in it) is unsat
-int checkSolution(struct Clause * root){
+int checkSolution(struct Clause * root, int * valuation){
   if (containsEmptyClause(root)) return UNSATISFIABLE;
-  if (areAllClausesUnit(root)) return SATISFIABLE; //check if not conflict
+  if (areAllClausesUnit(root, valuation)) return SATISFIABLE; //check if not conflict
   return UNCERTAIN;
 }
 
@@ -451,14 +464,18 @@ struct Clause * cloneClause(struct Clause * origin){
 }
 
 // deep clones a clause set and injects a new unit clause with the given literal index
-// this is how branching is performed
-struct Clause * branch(struct Clause * root, int literalIndex){
+struct Clause * branch(struct Clause * root, int literalIndex, int * valuation){
   if (DEBUG) printf("Branching with literal %d\n", literalIndex);
   if (DEBUG) printf("Setting value of literal %d as %d\n", abs(literalIndex), literalIndex > 0 ? 1 : 0);
 
   // set the valuation of the literal
   // we may backtrack and this valuation may become obsolete, but it doesn't matter
   // since the backtracked branch will overwrite this with the new valuation
+  // #pragma omp critical (branchValuation)
+  // {
+  //   valuation[abs(literalIndex)] = literalIndex > 0 ? 1 : 0;
+  // }
+
   valuation[abs(literalIndex)] = literalIndex > 0 ? 1 : 0;
 
   struct Clause * newClone = NULL,
@@ -510,10 +527,23 @@ void removeClause(struct Clause * root){
   }
 }
 
+void removeClause_print(struct Clause * root){
+  int count =0;
+  while (root != NULL) {
+    printClause(root);
+    printf(" (%d)\n", count++);
+    
+    struct Clause * next = root->next;
+    if (root->head != NULL) removeLiteral(root->head);
+    free(root);
+    root = next;
+  }
+}
+
 // DPLL algorithm with recursive backtracking
-int dpll(struct Clause * root){
+int dpll(struct Clause * root, int * valuation){
   // first check if we are already in a solved state
-  int solution = checkSolution(root);
+  int solution = checkSolution(root, valuation);
   if (solution != UNCERTAIN){
     removeClause(root);
     return solution;
@@ -521,45 +551,66 @@ int dpll(struct Clause * root){
 
   // do unit-propagation as long as the clause set allows
   while(1){
-    solution = checkSolution(root);
+    solution = checkSolution(root, valuation);
     if (solution != UNCERTAIN){
       removeClause(root);
       return solution;
     }
-    if (!unitPropagation(root)) break;
+    if (!unitPropagation(root, valuation)) break;
   }
 
   // then do pure-literal-elimination as long as the clause set allows
   while(1){
-    int solution = checkSolution(root);
+    int solution = checkSolution(root, valuation);
     if (solution != UNCERTAIN) {
       removeClause(root);
       return solution;
     }
-    if (!pureLiteralElimination(root)) break;
+    if (!pureLiteralElimination(root, valuation)) break;
   }
 
   // if we are stuck, then choose a random literal and branch on it
   int literalIndex = chooseLiteral(root);
   if (DEBUG) printf("Branching on literal %d\n", literalIndex);
 
+  //deep cloning the valuation array and handover to both child
+  int * valuation_cpy1 = (int *) calloc(variableNumber + 1, sizeof(int));
+  int * valuation_cpy2 = (int *) calloc(variableNumber + 1, sizeof(int));
+
+  memcpy(valuation_cpy1, valuation, (variableNumber + 1) * sizeof(int));
+  memcpy(valuation_cpy2, valuation, (variableNumber + 1) * sizeof(int));
+ 
   //TODO: thread
   //   - insert a new unit clause with this chosen literal, and recurse
-  if (dpll(branch(root, literalIndex)) == SATISFIABLE) return SATISFIABLE;
+  // if (dpll(branch(root, literalIndex)) == SATISFIABLE) return SATISFIABLE;
 
-  //   - if it doesn't yield a solution, try the same with the negated literal
-  return dpll(branch(root, -literalIndex));
-  // int dpll_result_org, dpll_result_neg;
+  // //   - if it doesn't yield a solution, try the same with the negated literal
+  // return dpll(branch(root, -literalIndex));
 
-  // #pragma omp task default(none) shared(dpll_result_org, literalIndex) firstprivate(root);
-  // dpll_result_org = dpll(branch(root, literalIndex));
+  int dpll_result_org, dpll_result_neg;
+
+  #pragma omp task default(none) shared(dpll_result_org, literalIndex, valuation_cpy1) firstprivate(root)
+  dpll_result_org = dpll(branch(root, literalIndex, valuation_cpy1), valuation_cpy1);
   
-  // #pragma omp task default(none) shared(dpll_result_neg, literalIndex) firstprivate(root);
-  // dpll_result_neg = dpll(branch(root, -literalIndex));
+  #pragma omp task default(none) shared(dpll_result_neg, literalIndex, valuation_cpy2) firstprivate(root)
+  dpll_result_neg = dpll(branch(root, -literalIndex, valuation_cpy2), valuation_cpy2);
 
-  // #pragma omp taskwait
+  #pragma omp taskwait
 
-  // return dpll_result_org || dpll_result_neg;
+  //copy the result back
+  if(dpll_result_org == SATISFIABLE){
+    memcpy(valuation, valuation_cpy1, (variableNumber + 1) * sizeof(int));
+    free(valuation_cpy1);
+    free(valuation_cpy2);
+
+    return SATISFIABLE;
+  }
+  // printf("dpll_result_neg free %p %p\n");
+  memcpy(valuation, valuation_cpy2, (variableNumber + 1) * sizeof(int));
+  free(valuation_cpy1);
+  free(valuation_cpy2);
+
+  return dpll_result_neg;
 }
 
 // writes the solution to the given file
@@ -573,7 +624,7 @@ void writeSolution(struct Clause * root, char * filename){
   // iterate over valuation array to print the values of each literal
   int i;
   for (i = 1; i < variableNumber + 1; i++) {
-    fprintf(f, "%d %d\n", i, valuation[i]);
+    fprintf(f, "%d %d\n", i, valuation_global[i]);
   }
 
   fclose(f);
@@ -587,9 +638,11 @@ int main(int argc, char *argv[]){
 
   struct Clause * root = readClauseSet_omp(argv[1]);
   // printf("Done read clause\n");
-  // #pragma omp parallel
-  // #pragma omp single
-  int result = dpll(root);
+  int result;
+
+  #pragma omp parallel
+  #pragma omp single
+  result = dpll(root, valuation_global);
 
   if (result == SATISFIABLE) {
     printf("SATISFIABLE\n");
@@ -599,5 +652,7 @@ int main(int argc, char *argv[]){
   }
 
   removeClause(root);
+  free(valuation_global);
+
   return 0;
 }
