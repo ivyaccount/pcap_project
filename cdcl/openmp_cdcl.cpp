@@ -84,7 +84,7 @@ private:
   random_device random_generator;
   mt19937 generator;
 
-  int unit_propagate(int); // to perform unit propagation
+  int unit_propagate_parallel(int); // to perform unit propagation
   // to assign a literal with given value, antecedent and decision level
   void assign_literal(int, int, int);
   void unassign_literal(int); // to unassign a given literal
@@ -198,9 +198,9 @@ int SATSolverCDCL::CDCL() {
     return RetVal::r_unsatisfied;
   }
   // initial unit propagation to find existing top level conflicts
-  int unit_propagate_result = unit_propagate(decision_level);
-  if (unit_propagate_result == RetVal::r_unsatisfied) {
-    return unit_propagate_result;
+  int unit_propagate_parallel_result = unit_propagate_parallel(decision_level);
+  if (unit_propagate_parallel_result == RetVal::r_unsatisfied) {
+    return unit_propagate_parallel_result;
   }
   while (!all_variables_assigned()) {
     
@@ -215,11 +215,11 @@ int SATSolverCDCL::CDCL() {
      * we found that the formula is unsatisfiable
      */
     while (true) {
-      unit_propagate_result = unit_propagate(decision_level);
-      if (unit_propagate_result == RetVal::r_unsatisfied) {
+      unit_propagate_parallel_result = unit_propagate_parallel(decision_level);
+      if (unit_propagate_parallel_result == RetVal::r_unsatisfied) {
         // if the conflict was at the top level, the formula is unsatisfiable
         if (decision_level == 0) {
-          return unit_propagate_result;
+          return unit_propagate_parallel_result;
         }
         /*
          * if not, perform the conflict analysis, learn clauses, and backtrack
@@ -244,9 +244,9 @@ int SATSolverCDCL::CDCL_parallel() {
     return RetVal::r_unsatisfied;
   }
 
-  int unit_propagate_result = unit_propagate(decision_level);
-  if (unit_propagate_result == RetVal::r_unsatisfied) {
-    return unit_propagate_result;
+  int unit_propagate_parallel_result = unit_propagate_parallel(decision_level);
+  if (unit_propagate_parallel_result == RetVal::r_unsatisfied) {
+    return unit_propagate_parallel_result;
   }
 
   while (!all_variables_assigned()) {
@@ -272,7 +272,7 @@ int SATSolverCDCL::CDCL_parallel() {
       #pragma omp parallel for shared(conflict_occurred)
       for (int i = 0; i < clause_count; i++) {
         if (!conflict_occurred) {
-          int result = unit_propagate(decision_level);
+          int result = unit_propagate_parallel(decision_level);
           if (result == RetVal::r_unsatisfied) {
             #pragma omp atomic write
             conflict_occurred = 1;
@@ -306,70 +306,66 @@ int SATSolverCDCL::CDCL_parallel() {
  * conflicts RetVal::r_unsatisfied - unit propagation found a
  * conflict
  */
-int SATSolverCDCL::unit_propagate(int decision_level) {
-  bool unit_clause_found = false; // if a unit clause has been found
-  int false_count = 0;            // number of false literals in the clause
-  int unset_count = 0;            // number of unset literals in the clause
+int SATSolverCDCL::unit_propagate_parallel(int decision_level) {
+  bool unit_clause_found = false;
+  int false_count = 0;
+  int unset_count = 0;
   int literal_index;
-  bool satisfied_flag =
-      false; // if the clause is satisfied due to the presence of a true literal
-  int last_unset_literal = -1; // index of an unset literal
+  bool satisfied_flag = false;
+  int last_unset_literal = -1;
+
   do {
     unit_clause_found = false;
-    // iterate over all clauses if no unit clause has been found so far
-    for (int i = 0; i < literal_list_per_clause.size() && !unit_clause_found;
-         i++) {
+
+    #pragma omp parallel for shared(unit_clause_found, last_unset_literal) private(false_count, unset_count, literal_index, satisfied_flag)
+    for (int i = 0; i < literal_list_per_clause.size(); i++) {
       false_count = 0;
       unset_count = 0;
       satisfied_flag = false;
-      // iterate over all literals
+
+      int local_last_unset_literal = -1;
+
       for (int j = 0; j < literal_list_per_clause[i].size(); j++) {
-        // get the vector index of the literal
-        literal_index =
-            literal_to_variable_index(literal_list_per_clause[i][j]);
-        if (literals[literal_index] == -1) // if unassigned
-        {
+        literal_index = literal_to_variable_index(literal_list_per_clause[i][j]);
+
+        if (literals[literal_index] == -1) {
           unset_count++;
-          last_unset_literal = j; // store the index, may be needed later
-        } else if ((literals[literal_index] == 0 &&
-                    literal_list_per_clause[i][j] > 0) ||
-                   (literals[literal_index] == 1 &&
-                    literal_list_per_clause[i][j] <
-                        0)) // if false in the clause
-        {
+          local_last_unset_literal = j;
+        } else if ((literals[literal_index] == 0 && literal_list_per_clause[i][j] > 0) ||
+                   (literals[literal_index] == 1 && literal_list_per_clause[i][j] < 0)) {
           false_count++;
-        } else // if true in the clause, so the clause is satisfied
-        {
+        } else {
           satisfied_flag = true;
           break;
         }
       }
-      if (satisfied_flag) // if the clause is satisfied, move to the next
-      {
+
+      if (satisfied_flag) {
         continue;
       }
-      // if exactly one literal is unset, this clause is unit
+
       if (unset_count == 1) {
-        // assign the unset literal at this decision level and this clause i as
-        // the antecedent
-        assign_literal(literal_list_per_clause[i][last_unset_literal],
-                       decision_level, i);
-        unit_clause_found =
-            true; // we have found a unit clause, so restart iteratin
+        #pragma omp critical
+        {
+          assign_literal(literal_list_per_clause[i][local_last_unset_literal], decision_level, i);
+          unit_clause_found = true;
+          last_unset_literal = local_last_unset_literal;
+        }
         break;
-      }
-      // if the clause is unsatisfied
-      else if (false_count == literal_list_per_clause[i].size()) {
-        // unsatisfied clause
-        kappa_antecedent = i; // set the antecedent of kappa to this clause
-        return RetVal::r_unsatisfied; // return a conflict status
+      } else if (false_count == literal_list_per_clause[i].size()) {
+        #pragma omp critical
+        {
+          kappa_antecedent = i;
+          return RetVal::r_unsatisfied;
+        }
       }
     }
-  } while (unit_clause_found); // if a unit clause was found, we restart
-                               // iterating over the clauses
+  } while (unit_clause_found);
+
   kappa_antecedent = -1;
-  return RetVal::r_normal; // return normally
+  return RetVal::r_normal;
 }
+
 
 /*
  * function to assign a value, decision level, and antecedent to a variable
