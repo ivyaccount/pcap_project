@@ -245,6 +245,74 @@ char* criticalfGets(char* line, size_t line_sz, FILE * fp) {
   return res;
 }
 
+struct Clause * readClauseSet(char * filename){
+  FILE * fp;
+  char line[256];
+  size_t len = 0;
+
+  fp = fopen(filename, "r");
+  if (fp == NULL) exit(1);
+
+  // define loop variables
+  char * token;
+  struct Clause * root = NULL, * currentClause = NULL, * previousClause = NULL;
+  struct Literal * currentLiteral = NULL, * previousLiteral = NULL;
+
+  while(fgets(line, sizeof(line), fp)){
+    // ignore comment lines
+    if (line[0] == 'c') continue;
+    // this line is metadata information
+    if (line[0] == 'p') {
+      sscanf(line, "p cnf %d %d", &variableNumber, &clauseNumber);
+      if (DEBUG) printf("Number of variables: %d\n", variableNumber);
+      if (DEBUG) printf("Number of clauses: %d\n", clauseNumber);
+      valuation_global = (int*) calloc(variableNumber + 1, sizeof(int));
+      int i;
+      for (i = 0; i < variableNumber + 1; i++) valuation_global[i] = -1;
+    } else {
+      // create a clause for each line
+      currentClause = createClause();
+      if (root == NULL) {
+        if (DEBUG) printf("setting root\n");
+        root = currentClause;
+      }
+      if (previousClause != NULL) {
+        if (DEBUG) printf("setting current as the next of previous clause\n");
+        previousClause->next = currentClause;
+      }
+
+      // split the line by the space characted and parse integers as literals
+      token = strtok(line, " ");
+      while(token != NULL){
+        int literalIndex = atoi(token);
+        currentLiteral = createLiteral();
+        currentLiteral->index = literalIndex;
+        if (literalIndex != 0){
+          if (currentClause->head == NULL){
+            if (DEBUG) printf("setting literal %d as head of current clause\n", currentLiteral->index);
+            currentClause->head = currentLiteral;
+          }
+
+          if (previousLiteral != NULL){
+            if (DEBUG) printf("setting literal %d as the next of previous literal\n", currentLiteral->index);
+            previousLiteral->next = currentLiteral;
+          }
+        }
+
+        if (DEBUG) printf("current literal is now previous literal\n");
+        previousLiteral = currentLiteral;
+
+        token = strtok(NULL, " ");
+      }
+      if (DEBUG) printf("current clause is now previous clause\n");
+      previousClause = currentClause;
+    }
+  }
+  fclose(fp);
+
+  return root;
+}
+
 // reads the clause set from the given file and constructs a linked list of linked lists
 // The clauses is a linked list, in each clause, the literal is also a linked list
 struct Clause * readClauseSet_omp(char * filename){
@@ -541,7 +609,7 @@ void removeClause_print(struct Clause * root){
 }
 
 // DPLL algorithm with recursive backtracking
-int dpll(struct Clause * root, int * valuation){
+int dpll(struct Clause * root, int * valuation, int unsolveLiterals){
   // first check if we are already in a solved state
   int solution = checkSolution(root, valuation);
   if (solution != UNCERTAIN){
@@ -557,6 +625,8 @@ int dpll(struct Clause * root, int * valuation){
       return solution;
     }
     if (!unitPropagation(root, valuation)) break;
+
+    unsolveLiterals -= 1;
   }
 
   // then do pure-literal-elimination as long as the clause set allows
@@ -567,6 +637,8 @@ int dpll(struct Clause * root, int * valuation){
       return solution;
     }
     if (!pureLiteralElimination(root, valuation)) break;
+
+    unsolveLiterals -= 1;
   }
 
   // if we are stuck, then choose a random literal and branch on it
@@ -588,12 +660,14 @@ int dpll(struct Clause * root, int * valuation){
   // return dpll(branch(root, -literalIndex));
 
   int dpll_result_org, dpll_result_neg;
+  // printf("unsolveLiterals: %d\n", unsolveLiterals);
 
-  #pragma omp task default(none) shared(dpll_result_org, literalIndex, valuation_cpy1) firstprivate(root)
-  dpll_result_org = dpll(branch(root, literalIndex, valuation_cpy1), valuation_cpy1);
+  //if (unsolveLiterals > (int) (variableNumber))
+  #pragma omp task if (unsolveLiterals > (int) ((variableNumber * 3)/4)) default(none) shared(dpll_result_org, literalIndex, valuation_cpy1) firstprivate(root, unsolveLiterals)
+  dpll_result_org = dpll(branch(root, literalIndex, valuation_cpy1), valuation_cpy1, unsolveLiterals);
   
-  #pragma omp task default(none) shared(dpll_result_neg, literalIndex, valuation_cpy2) firstprivate(root)
-  dpll_result_neg = dpll(branch(root, -literalIndex, valuation_cpy2), valuation_cpy2);
+  #pragma omp task if (unsolveLiterals > (int) ((variableNumber * 3)/4)) default(none) shared(dpll_result_neg, literalIndex, valuation_cpy2) firstprivate(root, unsolveLiterals)
+  dpll_result_neg = dpll(branch(root, -literalIndex, valuation_cpy2), valuation_cpy2, unsolveLiterals);
 
   #pragma omp taskwait
 
@@ -636,13 +710,13 @@ int main(int argc, char *argv[]){
     return 1;
   }
 
-  struct Clause * root = readClauseSet_omp(argv[1]);
+  struct Clause * root = readClauseSet(argv[1]);
   // printf("Done read clause\n");
   int result;
 
   #pragma omp parallel
   #pragma omp single
-  result = dpll(root, valuation_global);
+  result = dpll(root, valuation_global, variableNumber);
 
   if (result == SATISFIABLE) {
     printf("SATISFIABLE\n");
